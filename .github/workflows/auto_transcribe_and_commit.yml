@@ -1,0 +1,67 @@
+name: Auto Transcribe & Commit Subtitles
+
+on:
+  push:
+    paths:
+      - 'examples/**'
+
+permissions:
+  contents: write
+
+jobs:
+  transcribe-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Transcribe new files
+        run: |
+          CHANGED=$(git --no-pager diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep '^examples/' || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No example files changed."
+            exit 0
+          fi
+          for f in $CHANGED; do
+            if [ -f "$f" ]; then
+              echo "Transcribing $f..."
+              python -m src.autosub.transcribe_accurate --input "$f" --model small --device cpu || echo "Failed on $f"
+            fi
+          done
+
+      - name: Commit generated subtitles
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A '*.srt' '*.vtt' || true
+          if git diff --cached --quiet; then
+            echo "No subtitles to commit."
+            exit 0
+          fi
+          git commit -m "Auto-generated subtitles [skip ci]"
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Upload subtitles as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-subtitles
+          path: |
+            **/*.srt
+            **/*.vtt
