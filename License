@@ -1,0 +1,15 @@
+
+---
+
+## ⚙️ `requirements.txt`
+```text
+torch>=1.12.0
+whisper
+whisperx
+ffmpeg-python
+numpy
+pydub
+watchdog
+pytest
+# Optional diarization
+pyannote.audio
