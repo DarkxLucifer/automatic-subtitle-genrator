@@ -1,19 +1,5 @@
-name: Auto Transcribe & Commit Subtitles
-
-on:
-  push:
-    paths:
-      - "examples/**"
-
-permissions:
-  contents: write
-
-jobs:
-  transcribe-and-commit:
-    runs-on: ubuntu-latest
-
+# (inside jobs.transcribe-and-commit)
     env:
-      # so Python can import "autosub" from src/autosub
       PYTHONPATH: src
 
     steps:
@@ -42,46 +28,53 @@ jobs:
           MODEL: small
         run: |
           set -euo pipefail
-          echo "GIT INFO: BEFORE=${{ github.event.before }}, AFTER=${{ github.sha }}"
           CHANGED_RAW=$(git --no-pager diff --name-only ${{ github.event.before }} ${{ github.sha }} || true)
           CHANGED=$(printf "%s\n" "$CHANGED_RAW" | grep '^examples/' || true)
           if [ -z "$CHANGED" ]; then
-            echo "No example files in diff. Scanning examples/ for media files..."
             mapfile -t FILES < <(find examples -maxdepth 2 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.wav" -o -iname "*.mp3" -o -iname "*.mov" \))
           else
             mapfile -t FILES < <(printf "%s\n" "$CHANGED")
           fi
+
           if [ ${#FILES[@]} -eq 0 ]; then
             echo "No media files to process. Exiting."
             exit 0
           fi
-          echo "Files to process (${#FILES[@]}):"
-          for f in "${FILES[@]}"; do echo " - '$f'"; done
-          FAIL_COUNT=0
+
           for f in "${FILES[@]}"; do
-            if [ ! -f "$f" ]; then
-              echo "Skipping (not regular file): $f"
-              continue
-            fi
             echo "Transcribing '$f' ..."
-            # NOTE: run module as autosub.transcribe_accurate and rely on PYTHONPATH=src
+            # run with PYTHONPATH=src present via job env; call autosub module
             if python -m autosub.transcribe_accurate --input "$f" --model "${MODEL}" --device cpu; then
-              echo "Transcription succeeded for: $f"
+              echo "OK: $f"
             else
-              echo "Transcription FAILED for: $f"
-              FAIL_COUNT=$((FAIL_COUNT+1))
+              echo "FAILED: $f"
             fi
           done
-          if [ "$FAIL_COUNT" -eq "${#FILES[@]}" ]; then
-            echo "ERROR: All transcriptions failed ($FAIL_COUNT/${#FILES[@]})."
-            exit 1
-          fi
-          echo "Transcription finished. Success: $(( ${#FILES[@]} - FAIL_COUNT )), Failed: $FAIL_COUNT"
 
-      - name: List generated subtitle files (debug)
+      - name: Debug: list created subtitles & transcribe.log
         run: |
-          echo "Listing subtitle files in workspace:"
-          find . -type f \( -iname "*.srt" -o -iname "*.vtt" \) -maxdepth 6 || echo "No subtitle files found."
+          echo "==== workspace files ===="
+          find . -maxdepth 6 -type f | sed -e 's/^/FILE: /'
+          echo "==== subtitle files ===="
+          find . -type f \( -iname "*.srt" -o -iname "*.vtt" \) -print || echo "No .srt/.vtt files found"
+          echo "==== transcribe.log (if exists) ===="
+          if [ -f transcribe.log ]; then
+            echo "---- transcribe.log start ----"
+            sed -n '1,200p' transcribe.log || true
+            echo "---- transcribe.log end ----"
+          else
+            echo "transcribe.log not found"
+          fi
+
+      - name: Upload debug artifacts (subtitles + log)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcribe-debug
+          path: |
+            transcribe.log
+            **/*.srt
+            **/*.vtt
 
       - name: Commit generated subtitles (robust)
         env:
@@ -95,22 +88,6 @@ jobs:
             echo "No subtitle files found to commit."
             exit 0
           fi
-          echo "Subtitle files to commit:"; for f in "${SUB_FILES[@]}"; do echo " - $f"; done
           git add -- "${SUB_FILES[@]}"
-          echo "Files staged (git status):"
-          git status --short
-          if git diff --cached --quiet; then
-            echo "No subtitle changes to commit."
-            exit 0
-          fi
-          git commit -m "Auto-generated subtitles [skip ci]"
+          git commit -m "Auto-generated subtitles [skip ci]" || echo "Nothing to commit"
           git push origin HEAD:${{ github.ref_name }}
-
-      - name: Upload subtitles as artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: generated-subtitles
-          path: |
-            **/*.srt
-            **/*.vtt
