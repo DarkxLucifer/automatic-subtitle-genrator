@@ -12,6 +12,10 @@ jobs:
   transcribe-and-commit:
     runs-on: ubuntu-latest
 
+    env:
+      # so Python can import "autosub" from src/autosub
+      PYTHONPATH: src
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,57 +42,41 @@ jobs:
           MODEL: small
         run: |
           set -euo pipefail
-
-          echo "GIT INFO:"
-          echo "  BEFORE: ${{ github.event.before }}"
-          echo "  AFTER:  ${{ github.sha }}"
-          echo "Raw git diff (names only):"
-          git --no-pager diff --name-only ${{ github.event.before }} ${{ github.sha }} || true
-          echo "----"
-
+          echo "GIT INFO: BEFORE=${{ github.event.before }}, AFTER=${{ github.sha }}"
           CHANGED_RAW=$(git --no-pager diff --name-only ${{ github.event.before }} ${{ github.sha }} || true)
-          printf "%s\n" "$CHANGED_RAW"
-          echo "----"
-
           CHANGED=$(printf "%s\n" "$CHANGED_RAW" | grep '^examples/' || true)
           if [ -z "$CHANGED" ]; then
-            echo "No example files in diff. Falling back to scanning examples/ for media files."
+            echo "No example files in diff. Scanning examples/ for media files..."
             mapfile -t FILES < <(find examples -maxdepth 2 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.wav" -o -iname "*.mp3" -o -iname "*.mov" \))
           else
             mapfile -t FILES < <(printf "%s\n" "$CHANGED")
           fi
-
           if [ ${#FILES[@]} -eq 0 ]; then
             echo "No media files to process. Exiting."
             exit 0
           fi
-
           echo "Files to process (${#FILES[@]}):"
-          for f in "${FILES[@]}"; do
-            echo " - '$f'"
-          done
-
+          for f in "${FILES[@]}"; do echo " - '$f'"; done
           FAIL_COUNT=0
           for f in "${FILES[@]}"; do
             if [ ! -f "$f" ]; then
-              echo "Skipping (not a regular file): $f"
+              echo "Skipping (not regular file): $f"
               continue
             fi
             echo "Transcribing '$f' ..."
-            if python -m src.autosub.transcribe_accurate --input "$f" --model "${MODEL}" --device cpu; then
+            # NOTE: run module as autosub.transcribe_accurate and rely on PYTHONPATH=src
+            if python -m autosub.transcribe_accurate --input "$f" --model "${MODEL}" --device cpu; then
               echo "Transcription succeeded for: $f"
             else
               echo "Transcription FAILED for: $f"
               FAIL_COUNT=$((FAIL_COUNT+1))
             fi
           done
-
           if [ "$FAIL_COUNT" -eq "${#FILES[@]}" ]; then
-            echo "ERROR: All transcriptions failed ($FAIL_COUNT/${#FILES[@]}). See above logs."
+            echo "ERROR: All transcriptions failed ($FAIL_COUNT/${#FILES[@]})."
             exit 1
           fi
-
-          echo "Transcription step finished. Successful: $(( ${#FILES[@]} - FAIL_COUNT )), Failed: $FAIL_COUNT"
+          echo "Transcription finished. Success: $(( ${#FILES[@]} - FAIL_COUNT )), Failed: $FAIL_COUNT"
 
       - name: List generated subtitle files (debug)
         run: |
@@ -102,28 +90,19 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           mapfile -t SUB_FILES < <(find . -maxdepth 6 -type f \( -iname "*.srt" -o -iname "*.vtt" \) -print)
-
           if [ ${#SUB_FILES[@]} -eq 0 ]; then
             echo "No subtitle files found to commit."
             exit 0
           fi
-
-          echo "Subtitle files to commit:"
-          for f in "${SUB_FILES[@]}"; do
-            echo " - $f"
-          done
-
+          echo "Subtitle files to commit:"; for f in "${SUB_FILES[@]}"; do echo " - $f"; done
           git add -- "${SUB_FILES[@]}"
           echo "Files staged (git status):"
           git status --short
-
           if git diff --cached --quiet; then
             echo "No subtitle changes to commit."
             exit 0
           fi
-
           git commit -m "Auto-generated subtitles [skip ci]"
           git push origin HEAD:${{ github.ref_name }}
 
