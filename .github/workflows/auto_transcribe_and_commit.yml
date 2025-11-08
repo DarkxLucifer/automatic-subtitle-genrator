@@ -1,3 +1,36 @@
+name: Auto Transcribe & Commit Subtitles
+
+on:
+  push:
+    paths:
+      - 'examples/**'
+
+permissions:
+  contents: write
+
+jobs:
+  transcribe-and-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Transcribe changed files (robust + debug)
         env:
           MODEL: small
@@ -11,20 +44,16 @@
           git --no-pager diff --name-only ${{ github.event.before }} ${{ github.sha }} || true
           echo "----"
 
-          # collect changed files under examples/
           CHANGED_RAW=$(git --no-pager diff --name-only ${{ github.event.before }} ${{ github.sha }} || true)
           echo "Raw changed files:"
-          echo "$CHANGED_RAW"
+          printf "%s\n" "$CHANGED_RAW"
           echo "----"
 
-          # filter lines that start with examples/
           CHANGED=$(printf "%s\n" "$CHANGED_RAW" | grep '^examples/' || true)
           if [ -z "$CHANGED" ]; then
             echo "No example files found in git diff. Falling back to scanning the examples/ folder for media files."
-            # find media files in examples/ (update extensions if you need)
-            mapfile -t FILES < <(find examples -maxdepth 2 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.wav" -o -iname "*.mp3" -o -iname "*.mov" \))
+            mapfile -t FILES < <(find examples -maxdepth 2 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.wav" -o -iname "*.mp3" -o -iname "*.mov" \) | sed -e 's/^[[:space:]]*//')
           else
-            # use changed files (preserve spaces)
             mapfile -t FILES < <(printf "%s\n" "$CHANGED")
           fi
 
@@ -38,7 +67,6 @@
             echo " - '$f'"
           done
 
-          # track failures
           FAIL_COUNT=0
           for f in "${FILES[@]}"; do
             if [ ! -f "$f" ]; then
@@ -46,7 +74,6 @@
               continue
             fi
             echo "Transcribing '$f' ..."
-            # keep the transcription command non-fatal so we can continue, but note failure
             if python -m src.autosub.transcribe_accurate --input "$f" --model "${MODEL}" --device cpu; then
               echo "Transcription succeeded for: $f"
             else
@@ -61,3 +88,40 @@
           fi
 
           echo "Transcription step finished. Successful: $(( ${#FILES[@]} - FAIL_COUNT )), Failed: $FAIL_COUNT"
+
+      - name: List generated subtitle files (debug)
+        run: |
+          echo "Listing subtitle files in workspace:"
+          find . -type f \( -iname "*.srt" -o -iname "*.vtt" \) -maxdepth 6 || echo "No subtitle files found."
+
+      - name: Commit generated subtitles
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage .srt and .vtt files (safe add)
+          git add -A '*.srt' '*.vtt' || true
+
+          echo "Files staged (git status):"
+          git status --short || true
+
+          if git diff --cached --quiet; then
+            echo "No subtitle changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Auto-generated subtitles [skip ci]"
+          # Push back to the branch that triggered the workflow
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Upload subtitles as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-subtitles
+          path: |
+            **/*.srt
+            **/*.vtt
