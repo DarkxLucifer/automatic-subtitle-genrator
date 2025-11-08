@@ -1,0 +1,18 @@
+# Core machine learning & transcription
+torch>=1.12.0
+whisper
+whisperx
+
+# Audio processing
+ffmpeg-python
+pydub
+numpy
+
+# Optional: Speaker diarization (only needed if you use --diarize)
+pyannote.audio
+
+# Folder watching automation
+watchdog
+
+# Testing (optional)
+pytest
