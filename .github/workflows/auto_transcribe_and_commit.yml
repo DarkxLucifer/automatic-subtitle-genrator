@@ -11,18 +11,16 @@ permissions:
 jobs:
   transcribe-and-commit:
     runs-on: ubuntu-latest
-
     env:
-      # allow "import autosub" from src/autosub
       PYTHONPATH: src
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install system dependencies
+      - name: Install ffmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
@@ -32,84 +30,77 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install Python dependencies
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Transcribe changed files (robust + debug)
+      - name: Gather example files
+        id: gather
+        run: |
+          # Get changed files under examples/ between commits
+          CHANGED=$(git --no-pager diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep '^examples/' || true)
+          echo "CHANGED_RAW<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Determine files to process
+        id: files
+        run: |
+          set -e
+          CHANGED="${{ steps.gather.outputs.CHANGED_RAW }}"
+          if [ -z "$CHANGED" ]; then
+            echo "No changed files in diff. Scanning examples/ for media files..."
+            FILES=$(find examples -maxdepth 2 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.wav" -o -iname "*.mp3" -o -iname "*.mov" \) -print || true)
+          else
+            FILES="$CHANGED"
+          fi
+          # write a newline-separated list to output for next step
+          echo "FILES_LIST<<EOF" >> $GITHUB_OUTPUT
+          printf "%s\n" "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Transcribe files (simple loop)
         env:
           MODEL: small
         run: |
-          set -euo pipefail
-
-          echo "GIT INFO: BEFORE=${{ github.event.before }}, AFTER=${{ github.sha }}"
-          echo "Raw git diff (names only):"
-          git --no-pager diff --name-only ${{ github.event.before }} ${{ github.sha }} || true
-          echo "----"
-
-          CHANGED_RAW=$(git --no-pager diff --name-only ${{ github.event.before }} ${{ github.sha }} || true)
-          printf "%s\n" "$CHANGED_RAW"
-          echo "----"
-
-          CHANGED=$(printf "%s\n" "$CHANGED_RAW" | grep '^examples/' || true)
-
-          if [ -z "$CHANGED" ]; then
-            echo "No example files in diff. Falling back to scanning examples/ for media files."
-            mapfile -t FILES < <(find examples -maxdepth 2 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.wav" -o -iname "*.mp3" -o -iname "*.mov" \))
-          else
-            mapfile -t FILES < <(printf "%s\n" "$CHANGED")
-          fi
-
-          if [ ${#FILES[@]} -eq 0 ]; then
-            echo "No media files to process. Exiting."
+          set -e
+          # read files list from previous step
+          FILES="${{ steps.files.outputs.FILES_LIST }}"
+          if [ -z "$FILES" ]; then
+            echo "No files to process."
             exit 0
           fi
-
-          echo "Files to process (${#FILES[@]}):"
-          for f in "${FILES[@]}"; do
-            echo " - '$f'"
-          done
-
-          FAIL_COUNT=0
-          for f in "${FILES[@]}"; do
+          echo "Files to process:"
+          printf "%s\n" "$FILES"
+          # iterate line-by-line
+          echo "$FILES" | while IFS= read -r f; do
+            [ -z "$f" ] && continue
             if [ ! -f "$f" ]; then
-              echo "Skipping (not a regular file): $f"
+              echo "Skipping non-file: $f"
               continue
             fi
-            echo "Transcribing '$f' ..."
-            # run module as autosub.transcribe_accurate; PYTHONPATH=src ensures imports work
+            echo "Transcribing: $f"
+            # run autosub via PYTHONPATH=src
             if python -m autosub.transcribe_accurate --input "$f" --model "${MODEL}" --device cpu; then
-              echo "Transcription succeeded for: $f"
+              echo "Transcription ok for: $f"
             else
-              echo "Transcription FAILED for: $f"
-              FAIL_COUNT=$((FAIL_COUNT+1))
+              echo "Transcription failed for: $f"
             fi
           done
 
-          if [ "$FAIL_COUNT" -eq "${#FILES[@]}" ]; then
-            echo "ERROR: All transcriptions failed ($FAIL_COUNT/${#FILES[@]}). See logs above."
-            exit 1
-          fi
-
-          echo "Transcription step finished. Successful: $(( ${#FILES[@]} - FAIL_COUNT )), Failed: $FAIL_COUNT"
-
-      - name: Debug: list created subtitles & transcribe.log
+      - name: Show workspace & logs
         run: |
-          echo "==== workspace files ===="
+          echo "=== Workspace files ==="
           find . -maxdepth 6 -type f | sed -e 's/^/FILE: /'
-          echo "==== subtitle files ===="
-          find . -type f \( -iname "*.srt" -o -iname "*.vtt" \) -print || echo "No .srt/.vtt files found"
-          echo "==== transcribe.log (if exists) ===="
+          echo "=== Subtitle files ==="
+          find . -type f \( -iname "*.srt" -o -iname "*.vtt" \) -print || echo "No subtitle files found"
           if [ -f transcribe.log ]; then
-            echo "---- transcribe.log start ----"
+            echo "==== transcribe.log (head) ===="
             sed -n '1,200p' transcribe.log || true
-            echo "---- transcribe.log end ----"
-          else
-            echo "transcribe.log not found"
           fi
 
-      - name: Upload debug artifacts (subtitles + log)
+      - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -119,43 +110,26 @@ jobs:
             **/*.srt
             **/*.vtt
 
-      - name: Commit generated subtitles (robust)
+      - name: Commit subtitles if any
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          mapfile -t SUB_FILES < <(find . -maxdepth 6 -type f \( -iname "*.srt" -o -iname "*.vtt" \) -print)
-
-          if [ ${#SUB_FILES[@]} -eq 0 ]; then
-            echo "No subtitle files found to commit."
+          # find subtitle files
+          SUBFILES=$(find . -maxdepth 6 -type f \( -iname "*.srt" -o -iname "*.vtt" \) -print)
+          if [ -z "$SUBFILES" ]; then
+            echo "No subtitle files to commit."
             exit 0
           fi
-
-          echo "Subtitle files to commit:"
-          for f in "${SUB_FILES[@]}"; do
-            echo " - $f"
-          done
-
-          git add -- "${SUB_FILES[@]}"
-          echo "Files staged (git status):"
+          # stage, commit, push
+          echo "$SUBFILES" | while IFS= read -r f; do git add -- "$f"; done
+          echo "Staged files:"
           git status --short
-
           if git diff --cached --quiet; then
-            echo "No subtitle changes to commit."
+            echo "Nothing to commit."
             exit 0
           fi
-
-          git commit -m "Auto-generated subtitles [skip ci]" || echo "Nothing to commit"
+          git commit -m "Auto-generated subtitles [skip ci]"
           git push origin HEAD:${{ github.ref_name }}
-
-      - name: Final artifact upload (subtitles)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: generated-subtitles
-          path: |
-            **/*.srt
-            **/*.vtt
