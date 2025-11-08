@@ -35,11 +35,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Gather example files
+      - name: Gather changed example files
         id: gather
         run: |
-          # Get changed files under examples/ between commits
           CHANGED=$(git --no-pager diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep '^examples/' || true)
+          # expose raw changed files (may be empty)
           echo "CHANGED_RAW<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGED" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -47,7 +47,6 @@ jobs:
       - name: Determine files to process
         id: files
         run: |
-          set -e
           CHANGED="${{ steps.gather.outputs.CHANGED_RAW }}"
           if [ -z "$CHANGED" ]; then
             echo "No changed files in diff. Scanning examples/ for media files..."
@@ -55,17 +54,14 @@ jobs:
           else
             FILES="$CHANGED"
           fi
-          # write a newline-separated list to output for next step
           echo "FILES_LIST<<EOF" >> $GITHUB_OUTPUT
           printf "%s\n" "$FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Transcribe files (simple loop)
+      - name: Transcribe files (loop)
         env:
           MODEL: small
         run: |
-          set -e
-          # read files list from previous step
           FILES="${{ steps.files.outputs.FILES_LIST }}"
           if [ -z "$FILES" ]; then
             echo "No files to process."
@@ -73,7 +69,6 @@ jobs:
           fi
           echo "Files to process:"
           printf "%s\n" "$FILES"
-          # iterate line-by-line
           echo "$FILES" | while IFS= read -r f; do
             [ -z "$f" ] && continue
             if [ ! -f "$f" ]; then
@@ -81,11 +76,11 @@ jobs:
               continue
             fi
             echo "Transcribing: $f"
-            # run autosub via PYTHONPATH=src
-            if python -m autosub.transcribe_accurate --input "$f" --model "${MODEL}" --device cpu; then
-              echo "Transcription ok for: $f"
+            # pass compute-type float32 for CPU runners
+            if python -m autosub.transcribe_accurate --input "$f" --model "${MODEL}" --device cpu --compute-type float32; then
+              echo "OK: $f"
             else
-              echo "Transcription failed for: $f"
+              echo "FAILED: $f"
             fi
           done
 
@@ -100,7 +95,7 @@ jobs:
             sed -n '1,200p' transcribe.log || true
           fi
 
-      - name: Upload debug artifacts
+      - name: Upload debug artifacts (log + subtitles)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -114,16 +109,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # find subtitle files
           SUBFILES=$(find . -maxdepth 6 -type f \( -iname "*.srt" -o -iname "*.vtt" \) -print)
           if [ -z "$SUBFILES" ]; then
             echo "No subtitle files to commit."
             exit 0
           fi
-          # stage, commit, push
           echo "$SUBFILES" | while IFS= read -r f; do git add -- "$f"; done
           echo "Staged files:"
           git status --short
@@ -131,5 +124,5 @@ jobs:
             echo "Nothing to commit."
             exit 0
           fi
-          git commit -m "Auto-generated subtitles [skip ci]"
+          git commit -m "Auto-generated subtitles [skip ci]" || echo "Nothing to commit"
           git push origin HEAD:${{ github.ref_name }}
